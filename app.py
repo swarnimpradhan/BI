@@ -2,29 +2,36 @@ import streamlit as st
 import pandas as pd
 import requests
 import os
-from google import genai  # Use the new GenAI SDK
+from google import genai
 from dotenv import load_dotenv
 
+# Load local environment variables (for local dev only)
 load_dotenv()
 
-# 1. Initialize Gemini Client
-# The SDK automatically looks for the GEMINI_API_KEY environment variable.
-client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+# --- 1. SECURE CONFIGURATION ---
+# Checks Streamlit Cloud Secrets first, then falls back to local .env
+GEMINI_API_KEY = st.secrets.get("GEMINI_API_KEY") or os.getenv("GEMINI_API_KEY")
+MONDAY_API_KEY = st.secrets.get("MONDAY_API_KEY") or os.getenv("MONDAY_API_KEY")
 
-# Configuration - Replace with your actual Board IDs
-DEALS_BOARD_ID = "5027110359"
+# Replace these with your actual Monday.com Board IDs
+DEALS_BOARD_ID = "5027110359" 
 WORK_BOARD_ID = "5027110768"
 
+# Initialize Gemini Client
+client = genai.Client(api_key=GEMINI_API_KEY)
+
+# --- 2. DATA FETCHING & RESILIENCE ---
 def fetch_monday_data(board_id):
+    """Fetches data from Monday.com and cleans it for the AI."""
     url = "https://api.monday.com/v2"
     headers = {
-        "Authorization": os.getenv("MONDAY_API_KEY"),
+        "Authorization": MONDAY_API_KEY,
         "API-Version": "2023-10"
     }
     query = f"""
     query {{
       boards(ids: {board_id}) {{
-        items_page {{
+        items_page(limit: 100) {{
           items {{
             name
             column_values {{
@@ -37,79 +44,90 @@ def fetch_monday_data(board_id):
     }}
     """
     try:
-        res = requests.post(url, json={'query': query}, headers=headers).json()
-        items = res["data"]["boards"][0]["items_page"]["items"]
+        response = requests.post(url, json={'query': query}, headers=headers)
+        response.raise_for_status()
+        data = response.json()
+        
+        items = data["data"]["boards"][0]["items_page"]["items"]
         rows = []
         for item in items:
-            row = {"Item Name": item["name"]}
-            for col in item["column_values"]:
-                row[col["column"]["title"]] = col["text"]
+            row = {"Item Name": item.get("name", "Unnamed")}
+            for col in item.get("column_values", []):
+                title = col.get("column", {}).get("title", "Unknown")
+                text = col.get("text", "")
+                row[title] = text
             rows.append(row)
-        # Data Resilience: Normalize and fill missing values
-        return pd.DataFrame(rows).fillna("Not Provided")
+        
+        # Data Resilience: Normalize messy data and handle nulls
+        df = pd.DataFrame(rows)
+        return df.fillna("Not Provided").replace(r'^\s*$', "Not Provided", regex=True)
+    
     except Exception as e:
-        st.error(f"Error fetching board {board_id}: {e}")
+        st.error(f"Failed to fetch board {board_id}: {e}")
         return pd.DataFrame()
 
-# Streamlit Page Config
-st.set_page_config(page_title="Skylark BI Agent", layout="wide")
-st.title("📊 Founder's BI Agent (Gemini Powered)")
+# --- 3. STREAMLIT INTERFACE ---
+st.set_page_config(page_title="Skylark BI Agent", page_icon="📊", layout="wide")
+st.title("📊 Founder's Business Intelligence Agent")
 
-# Sidebar for Setup & Quick Actions
-with st.sidebar:
-    st.header("Data Management")
-    if st.button("Sync Monday.com Data"):
-        with st.spinner("Fetching live data..."):
-            st.session_state.deals = fetch_monday_data(DEALS_BOARD_ID)
-            st.session_state.work = fetch_monday_data(WORK_BOARD_ID)
-            st.success("Data Synchronized!")
-
-    if st.button("✨ Generate Leadership Update"):
-        if "deals" in st.session_state:
-            st.session_state.messages.append({"role": "user", "content": "Give me a high-level summary for leadership."})
-        else:
-            st.warning("Sync data first!")
-
-# Initialize Chat History
+# Initialize chat history
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-# Display history
-for msg in st.session_state.messages:
-    with st.chat_message(msg["role"]):
-        st.markdown(msg["content"])
+# Sidebar for controls
+with st.sidebar:
+    st.header("Control Panel")
+    if st.button("🔄 Sync Live Data"):
+        with st.spinner("Accessing Monday.com..."):
+            st.session_state.deals_df = fetch_monday_data(DEALS_BOARD_ID)
+            st.session_state.work_df = fetch_monday_data(WORK_BOARD_ID)
+            st.success("Data Synchronized!")
+    
+    if st.button("✨ Leadership Summary"):
+        st.session_state.messages.append({
+            "role": "user", 
+            "content": "Provide a high-level leadership update summarizing our pipeline health and execution status."
+        })
 
-# Chat Input
-if prompt := st.chat_input("Ask about revenue, pipeline, or project status..."):
+# Display chat history
+for message in st.session_state.messages:
+    with st.chat_message(message["role"]):
+        st.markdown(message["content"])
+
+# User Input
+if prompt := st.chat_input("Ask about revenue, bottlenecks, or project health..."):
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
         st.markdown(prompt)
 
-    if "deals" not in st.session_state:
-        st.warning("Please sync data from the sidebar first.")
+    # 4. AI LOGIC
+    if "deals_df" not in st.session_state or st.session_state.deals_df.empty:
+        st.warning("Please Sync Live Data from the sidebar first.")
     else:
         with st.chat_message("assistant"):
-            # Prepare context for Gemini
-            data_context = f"""
-            DEALS DATA:
-            {st.session_state.deals.to_csv(index=False)}
+            # Context preparation
+            context_data = f"""
+            DEALS DATA (Pipeline):
+            {st.session_state.deals_df.to_csv(index=False)}
             
-            WORK ORDERS:
-            {st.session_state.work.to_csv(index=False)}
+            WORK ORDERS DATA (Execution):
+            {st.session_state.work_df.to_csv(index=False)}
             """
             
             try:
-                # Using Gemini 2.5 Flash (high volume, low latency, free tier)
+                # Using Gemini 2.5 Flash for speed and high volume
                 response = client.models.generate_content(
                     model="gemini-2.5-flash",
                     contents=[
-                        "You are a BI Analyst. Provide concise insights for a CEO. Mention data quality issues like 'Not Provided'.",
-                        f"Context:\n{data_context}",
+                        "You are a senior BI Analyst reporting to a CEO. Provide concise, strategic insights. Mention data quality caveats if fields are 'Not Provided'.",
+                        f"Context:\n{context_data}",
                         f"Question: {prompt}"
                     ]
                 )
-                answer = response.text
-                st.markdown(answer)
-                st.session_state.messages.append({"role": "assistant", "content": answer})
+                
+                full_response = response.text
+                st.markdown(full_response)
+                st.session_state.messages.append({"role": "assistant", "content": full_response})
+            
             except Exception as e:
-                st.error(f"AI Service Error: {e}")
+                st.error(f"AI Error: {e}")
