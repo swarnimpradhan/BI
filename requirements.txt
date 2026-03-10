@@ -1,8 +1,6 @@
-fastapi
-uvicorn
+streamlit==1.35.0
 pandas
 requests
-openai
-streamlit
-python-dotenv
 google-genai
+python-dotenv
+altair==5.3.0
