@@ -5,3 +5,4 @@ requests
 openai
 streamlit
 python-dotenv
+google-genai
